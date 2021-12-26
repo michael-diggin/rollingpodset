@@ -1,0 +1,24 @@
+# permissions for end users to edit rollingpodsets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rollingpodset-editor-role
+rules:
+- apiGroups:
+  - apps.michael-diggin.github.io
+  resources:
+  - rollingpodsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.michael-diggin.github.io
+  resources:
+  - rollingpodsets/status
+  verbs:
+  - get

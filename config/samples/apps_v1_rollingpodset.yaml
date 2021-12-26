@@ -1,0 +1,22 @@
+apiVersion: apps.michael-diggin.github.io/v1
+kind: RollingPodSet
+metadata:
+  name: rollingpodset-sample
+  labels:
+    project: sample-app
+spec:
+  replicas: 2
+  podTemplate:
+    metadata:
+      labels:
+        project: sample-app
+    spec:
+      containers:
+        - name: webserver  # The name that this container will have.
+          image: nginx:latest # The image on which it is based.
+          ports:               # The port(s) that will be open.
+            - containerPort: 80
+  cycleTime: 60
+  selector:
+    matchLabels:
+      project: sample-app
