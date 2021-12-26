@@ -33,8 +33,9 @@ import (
 )
 
 var (
-	podOwnerKey = ".metadata.controller"
-	apiGVStr    = appsv1.GroupVersion.String()
+	podOwnerKey           = ".metadata.controller"
+	apiGVStr              = appsv1.GroupVersion.String()
+	startedTimeAnnotation = "apps.michael-diggin.github.io/started-at"
 )
 
 type realClock struct{}
@@ -52,6 +53,7 @@ type RollingPodSetReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Clock
+	RequeueTime time.Duration
 }
 
 //+kubebuilder:rbac:groups=apps.michael-diggin.github.io,resources=rollingpodsets,verbs=get;list;watch;create;update;patch;delete
@@ -85,7 +87,7 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(req.Namespace), client.MatchingFields{podOwnerKey: req.Name}); err != nil {
 		log.Error(err, "unable to list child pods")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+		return ctrl.Result{RequeueAfter: r.RequeueTime}, err
 	}
 
 	pods := podList.Items
@@ -98,7 +100,7 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		rollingPodSet.Status.Replicas = rollingPodSet.Spec.Replicas
 		if err := r.Status().Update(ctx, &rollingPodSet); err != nil {
 			log.Error(err, "failed to update status")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+			return ctrl.Result{RequeueAfter: r.RequeueTime}, err
 		}
 	}
 
@@ -112,7 +114,6 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// if now - pod start time > cycle time -> delete + recreate
 	// should really be checking the status of the pods
 
-	// can do a bit better
 	// loop through the list once
 	// add to list for deletion if less < 0
 	// add to list if too old and increment newCount
@@ -124,15 +125,22 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	delPods := make([]corev1.Pod, 0, len(pods))
 
-	now := metav1.Now().Second()
+	now := time.Now().UTC().Unix()
 	for _, p := range pods {
 		if less < 0 {
 			delPods = append(delPods, p)
 			less++
 			continue
 		}
-		podDuration := now - p.Status.StartTime.Second()
-		if podDuration > int(rollingPodSet.Spec.CycleTime) {
+		startTime, err := getPodStartedTime(&p)
+		if err != nil {
+			log.Error(err, "failed to get pod started time annotation")
+			return ctrl.Result{RequeueAfter: r.RequeueTime}, err
+		}
+		podDuration := now - startTime.Unix()
+		msg := fmt.Sprintf("Pod duration %d seconds", podDuration)
+		log.Info(msg)
+		if podDuration > rollingPodSet.Spec.CycleTime {
 			delPods = append(delPods, p)
 			newPodCount++
 		}
@@ -142,14 +150,15 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// create the extra ones
 		for i := 0; i < newPodCount; i++ {
 			log.Info("creating a new pod")
-			pod, err := r.constructPod(&rollingPodSet)
+			startedTime := time.Now().UTC()
+			pod, err := r.constructPod(&rollingPodSet, &startedTime)
 			if err != nil {
 				log.Error(err, "unable to construct new pod")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+				return ctrl.Result{RequeueAfter: r.RequeueTime}, err
 			}
 			if err := r.Create(ctx, pod); err != nil {
 				log.Error(err, "unable to create pod")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+				return ctrl.Result{RequeueAfter: r.RequeueTime}, err
 			}
 		}
 	}
@@ -160,17 +169,15 @@ func (r *RollingPodSetReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			log.Info("deleting a pod")
 			if err := r.Delete(ctx, &p); err != nil {
 				log.Error(err, "unable to delete extra pod")
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+				return ctrl.Result{RequeueAfter: r.RequeueTime}, err
 			}
 		}
 	}
 
-	// requeue after 10 seconds
-	// this should be made configurable
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: r.RequeueTime}, nil
 }
 
-func (r *RollingPodSetReconciler) constructPod(rollPodSet *appsv1.RollingPodSet) (*corev1.Pod, error) {
+func (r *RollingPodSetReconciler) constructPod(rollPodSet *appsv1.RollingPodSet, startedTime *time.Time) (*corev1.Pod, error) {
 	name := fmt.Sprintf("%s-%d", rollPodSet.Name, time.Now().UnixNano())
 
 	pod := &corev1.Pod{
@@ -185,6 +192,7 @@ func (r *RollingPodSetReconciler) constructPod(rollPodSet *appsv1.RollingPodSet)
 	for k, v := range rollPodSet.Spec.PodTemplate.Annotations {
 		pod.Annotations[k] = v
 	}
+	pod.Annotations[startedTimeAnnotation] = startedTime.Format(time.RFC3339)
 	for k, v := range rollPodSet.Spec.PodTemplate.Labels {
 		pod.Labels[k] = v
 	}
@@ -193,6 +201,19 @@ func (r *RollingPodSetReconciler) constructPod(rollPodSet *appsv1.RollingPodSet)
 	}
 
 	return pod, nil
+}
+
+func getPodStartedTime(pod *corev1.Pod) (*time.Time, error) {
+	timeRaw := pod.Annotations[startedTimeAnnotation]
+	if len(timeRaw) == 0 {
+		return nil, nil
+	}
+
+	timeParsed, err := time.Parse(time.RFC3339, timeRaw)
+	if err != nil {
+		return nil, err
+	}
+	return &timeParsed, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
